@@ -46,620 +46,392 @@ includes the depths and capacities in mega‑newtons (MN).  See
 Streamlit interface.
 
 """
+# lpa_v50.py
+# Leg Penetration Analysis (V50 streamlit build)
+# Author: Srikanth & ChatGPT
+# Units: depth in m, Su in kPa, gamma' in kN/m3, forces in kN; plotting in MN
 
-from dataclasses import dataclass
+from __future__ import annotations
+from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
-
-import math
 import numpy as np
 import pandas as pd
 
+# ---------------- Version 50 switches (user-togglable from UI) ----------------
+USE_MIN_CU_POINT_AVG_DEFAULT = True      # use min(point, B/2-average)
+APPLY_PHI_REDUCTION_DEFAULT   = False    # subtract 5 degrees from phi' if True
+APPLY_WINDWARD_FACTOR_DEFAULT = False    # multiply REAL by 0.8 if True
+APPLY_SQUEEZE_TRIGGER_DEFAULT = True     # enforce B >= 3.45 T (1+1.1 D/B)
+
+# ---------------- Data models ----------------
+@dataclass
+class Spudcan:
+    rig_name: str
+    B: float                 # diameter (m)
+    A: float                 # area (m2)
+    tip_elev: float          # distance from tip to widest section (m)
+    preload_MN: float        # per leg, MN
 
 @dataclass
-class SoilDataPoint:
-    depth: float
-    value: float
-
+class SoilPoint:
+    z: float
+    v: float
 
 @dataclass
 class SoilLayer:
     name: str
-    top_depth: float
-    bottom_depth: float
-    soil_type: str  # "clay", "sand", "silt", or "unknown"
-    unit_weight_profile: List[SoilDataPoint]
-    su_profile: List[SoilDataPoint]
-    phi_profile: List[SoilDataPoint]
+    z_top: float
+    z_bot: float
+    soil_type: str           # "clay", "sand", "silt", "unknown"
+    gamma: List[SoilPoint] = field(default_factory=list)  # kN/m3 vs depth
+    su:    List[SoilPoint] = field(default_factory=list)  # kPa vs depth
+    phi:   List[SoilPoint] = field(default_factory=list)  # deg vs depth
 
-
-@dataclass
-class Spudcan:
-    rig_name: str
-    diameter: float
-    area: float
-    tip_elevation: float
-    max_preload: float  # kN
-
-
-# Default calculation flags – these mirror the VBA constants but
-# remain configurable in the UI layer.
-DEFAULT_USE_MIN_CU_POINT_AVG = True
-DEFAULT_APPLY_PHI_REDUCTION = False
-DEFAULT_APPLY_WINDWARD_CAPACITY_FACTOR = False
-DEFAULT_APPLY_SQUEEZING_TRIGGER = True
-
-
-def interpolate_profile(target_depth: float, profile: List[SoilDataPoint]) -> float:
-    """Interpolate a value from a depth‑value profile using linear interpolation.
-
-    If the profile is empty, returns 0.  If the depth is shallower
-    than the first point, the first value is returned.  If deeper
-    than the last point, the last value is returned.  Otherwise
-    performs linear interpolation between the two bounding points.
-    """
-    if not profile:
-        return 0.0
-    # If shallower than first point
-    if target_depth <= profile[0].depth:
-        return profile[0].value
-    # Walk through to find correct interval
-    for i in range(1, len(profile)):
-        if target_depth <= profile[i].depth:
-            d1, v1 = profile[i - 1].depth, profile[i - 1].value
-            d2, v2 = profile[i].depth, profile[i].value
-            if d2 == d1:
+# ---------------- Helpers: profiles ----------------
+def _interp(depth: float, prof: List[SoilPoint]) -> float:
+    """Linear interpolation with edge hold; NaN for empty."""
+    if not prof:
+        return np.nan
+    prof = sorted(prof, key=lambda p: p.z)
+    if depth <= prof[0].z:
+        return prof[0].v
+    for i in range(1, len(prof)):
+        if depth <= prof[i].z:
+            z1, v1 = prof[i-1].z, prof[i-1].v
+            z2, v2 = prof[i].z, prof[i].v
+            if z2 == z1:
                 return v1
-            return v1 + (target_depth - d1) * (v2 - v1) / (d2 - d1)
-    # Beyond last point
-    return profile[-1].value
+            return v1 + (depth - z1) * (v2 - v1) / (z2 - z1)
+    return prof[-1].v
 
+def _avg_over(z1: float, z2: float, prof: List[SoilPoint], dz: float = 0.05) -> float:
+    if not prof or z2 <= z1:
+        return np.nan
+    zs = np.arange(z1, z2 + 1e-9, dz)
+    vals = np.array([_interp(z, prof) for z in zs], dtype=float)
+    vals = vals[~np.isnan(vals)]
+    return float(vals.mean()) if vals.size else np.nan
 
-def avg_over_window_b2(start_depth: float, B: float, layers: List[SoilLayer], prop: str) -> float:
-    """Compute the average property value from start_depth to start_depth + B/2.
-
-    This integrates the soil property (Su or gamma') across the
-    relevant layers by sampling at 0.2 m increments.  Mirrors the VBA
-    `AvgOverWindow_B2` logic.
-    """
-    if B <= 0:
-        return 0.0
-    step = 0.2
-    end_depth = start_depth + B / 2.0
-    if end_depth <= start_depth:
-        return 0.0
-    total = 0.0
-    count = 0
-    d = start_depth
-    while d <= end_depth:
-        idx = get_layer_index_at_depth(d, layers)
-        layer = layers[idx]
-        if prop == "su":
-            val = interpolate_profile(d, layer.su_profile)
-        else:
-            # gamma'
-            val = interpolate_profile(d, layer.unit_weight_profile)
-        total += val
-        count += 1
-        d += step
-    return total / count if count > 0 else 0.0
-
-
-def get_overburden_pressure(depth: float, layers: List[SoilLayer]) -> float:
-    """Compute effective overburden pressure (sum of γ' × thickness) down to a depth.
-
-    Integrates the submerged unit weight across all layers down to
-    `depth`.  Mirrors the VBA `GetOverburdenPressure`.
-    """
-    total = 0.0
-    for layer in layers:
-        if depth > layer.top_depth:
-            if depth < layer.bottom_depth:
-                thick = depth - layer.top_depth
-            else:
-                thick = layer.bottom_depth - layer.top_depth
-            if thick > 0:
-                midpoint = layer.top_depth + 0.5 * thick
-                gamma_prime = interpolate_profile(midpoint, layer.unit_weight_profile)
-                total += gamma_prime * thick
-    return total
-
-
-def get_layer_index_at_depth(depth: float, layers: List[SoilLayer]) -> int:
-    """Return the index of the soil layer at a given depth.
-
-    If depth is deeper than the bottoms of all layers, returns the
-    last index.
-    """
-    for i, layer in enumerate(layers):
-        if depth >= layer.top_depth and depth < layer.bottom_depth:
+def _layer_index(z: float, layers: List[SoilLayer]) -> int:
+    for i, L in enumerate(layers):
+        if L.z_top <= z < L.z_bot:
             return i
     return len(layers) - 1
 
+def _has_su_here(z: float, layers: List[SoilLayer]) -> bool:
+    i = _layer_index(z, layers)
+    val = _interp(z, layers[i].su)
+    return np.isfinite(val) and val > 0
 
-def backflow_check(depth: float, B: float, layers: List[SoilLayer], meyerhof: List[SoilDataPoint]) -> bool:
-    """Check for backflow using a Meyerhof stability N chart.
+def _has_phi_here(z: float, layers: List[SoilLayer]) -> bool:
+    i = _layer_index(z, layers)
+    val = _interp(z, layers[i].phi)
+    return np.isfinite(val) and val > 0
 
-    Backflow is deemed to occur if d > (N × cu_avg) / γ_avg, where N
-    is interpolated from the Meyerhof chart as a function of d/B.
-    Returns False if there is no Meyerhof data or if the current
-    layer is not clay or silt.  Mirrors the VBA `backflow_check`.
-    """
-    if depth <= 0 or B <= 0 or not meyerhof:
-        return False
-    idx = get_layer_index_at_depth(depth, layers)
-    soil_type = layers[idx].soil_type
-    if soil_type not in ("clay", "silt"):
-        return False
-    ratio = depth / B
-    N_val = interpolate_profile(ratio, meyerhof)
-    cu_avg = avg_over_window_b2(depth, B, layers, "su")
-    gamma_avg = avg_over_window_b2(depth, B, layers, "gamma")
-    if gamma_avg <= 0:
-        return False
-    return depth > (N_val * cu_avg) / gamma_avg
+def _gamma_prime(z: float, layers: List[SoilLayer]) -> float:
+    i = _layer_index(z, layers)
+    return _interp(z, layers[i].gamma)
 
-
-def calculate_clay_capacity(spud: Spudcan, depth: float, layers: List[SoilLayer], has_backflow: bool,
-                            use_min_cu: bool) -> float:
-    """Calculate idle (general shear) bearing capacity in clay.
-
-    Returns the total vertical force in kN.  If either the spud
-    diameter is non‑positive or the effective undrained shear strength
-    is zero, returns 0.  Mirrors the VBA `CalculateClayCapacity`.
-    """
-    if spud.diameter <= 0:
+def _overburden(z: float, layers: List[SoilLayer], dz: float = 0.1) -> float:
+    """Vertical effective stress at depth z from seabed; integrates gamma'."""
+    if z <= 0:
         return 0.0
-    idx = get_layer_index_at_depth(depth, layers)
-    cu_point = interpolate_profile(depth, layers[idx].su_profile)
-    cu_avg = avg_over_window_b2(depth, spud.diameter, layers, "su")
-    # Select effective Su
-    if use_min_cu:
-        if cu_point > 0 and cu_avg > 0:
-            cu_eff = min(cu_point, cu_avg)
-        else:
-            cu_eff = max(cu_point, cu_avg)
+    zs = np.arange(0.0, z + 1e-9, dz)
+    gammas = np.array([_gamma_prime(zi, layers) for zi in zs], dtype=float)
+    gammas[np.isnan(gammas)] = 0.0
+    # trapezoid
+    return float(np.trapz(gammas, zs))
+
+# ---------------- Meyerhof stability N(d/B) ----------------
+# Default curve (smooth, conservative); users can override via UI
+_DEFAULT_MEYERHOF = pd.DataFrame({
+    "D_over_B": [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0],
+    "N":        [0.0,  2.0,  3.0,  3.6,  4.0,  4.7,  5.1],
+})
+
+def _meyerhof_N(d_over_B: float, table: Optional[pd.DataFrame]) -> float:
+    df = table if table is not None else _DEFAULT_MEYERHOF
+    x = np.asarray(df["D_over_B"], dtype=float)
+    y = np.asarray(df["N"], dtype=float)
+    if d_over_B <= x[0]:
+        return float(y[0])
+    if d_over_B >= x[-1]:
+        return float(y[-1])
+    j = np.searchsorted(x, d_over_B)
+    x1, x2 = x[j-1], x[j]
+    y1, y2 = y[j-1], y[j]
+    return float(y1 + (d_over_B - x1) * (y2 - y1) / (x2 - x1))
+
+# ---------------- Sand factors ----------------
+def _Nq(phi_rad: float) -> float:
+    return np.exp(np.pi * np.tan(phi_rad)) * np.tan(np.pi/4 + phi_rad/2)**2
+
+def _Ngamma(phi_rad: float) -> float:
+    return 2.0 * (_Nq(phi_rad) + 1.0) * np.tan(phi_rad)
+
+# ---------------- Capacities (kN) ----------------
+def clay_capacity(spud: Spudcan, z: float, layers: List[SoilLayer],
+                  use_min_cu: bool, backflow_zero: bool) -> Optional[float]:
+    B, A = spud.B, spud.A
+    if B <= 0 or A <= 0:
+        return None
+    i = _layer_index(z, layers)
+    if not _has_su_here(z, layers):
+        return None
+    cu_point = _interp(z, layers[i].su)
+    cu_avg   = _avg_over(z, z + B/2.0, layers[i].su)
+    cu_eff   = np.nanmin([cu_point, cu_avg]) if use_min_cu else cu_avg
+    if not np.isfinite(cu_eff) or cu_eff <= 0:
+        return None
+    Nc, sc = 5.14, 1.2
+    if B > 0:
+        d_over_B = z / B
+        dc = 1.0 + 0.2 * d_over_B if d_over_B <= 1.0 else 1.0 + 0.2 * np.arctan(d_over_B)
     else:
-        cu_eff = cu_avg
-    if cu_eff <= 0:
-        return 0.0
-    # Shape and depth factors for circular footing
-    Nc = 5.14
-    sc = 1.2
-    d_over_B = depth / spud.diameter if spud.diameter > 0 else 0.0
-    if d_over_B <= 1.0:
-        dc = 1.0 + 0.4 * d_over_B
-    else:
-        dc = 1.0 + 0.4 * math.atan(d_over_B)
-    po_prime = 0.0 if has_backflow else get_overburden_pressure(depth, layers)
-    Fv = (cu_eff * Nc * sc * dc + po_prime) * spud.area
-    return Fv
+        dc = 1.0
+    p0 = 0.0 if backflow_zero else _overburden(z, layers)
+    Fv = (cu_eff * Nc * sc * dc + p0) * A
+    return float(Fv)
 
+def sand_capacity(spud: Spudcan, z: float, layers: List[SoilLayer],
+                  apply_phi_reduction: bool) -> Optional[float]:
+    B, A = spud.B, spud.A
+    if B <= 0 or A <= 0:
+        return None
+    i = _layer_index(z, layers)
+    if not _has_phi_here(z, layers):
+        return None
+    phi = _interp(z, layers[i].phi)
+    if not np.isfinite(phi) or phi <= 0:
+        return None
+    if apply_phi_reduction:
+        phi = max(0.0, phi - 5.0)
+    phi_rad = np.deg2rad(phi)
+    Nq = _Nq(phi_rad)
+    Ng = _Ngamma(phi_rad)
+    gamma_p = _gamma_prime(z, layers)
+    p0 = _overburden(z, layers)
+    # shape/depth factors (simple)
+    sq, sg, dq, dg = 1.0 + np.tan(phi_rad), 0.6, 1.0 + 2.0*np.tan(phi_rad)*(1-np.sin(phi_rad))**2*(z/max(B,1e-6)), 1.0
+    Fv = (0.5 * gamma_p * B * Ng * sg * dg + p0 * Nq * sq * dq) * A
+    return float(max(Fv, 0.0))
 
-def calculate_sand_capacity(spud: Spudcan, depth: float, layers: List[SoilLayer],
-                            apply_phi_red: bool) -> float:
-    """Calculate idle (general shear) bearing capacity in sand.
-
-    Returns total vertical force in kN.  If φ is zero or undefined,
-    returns the overburden pressure contribution only (po' × area).
-    Mirrors the VBA `CalculateSandCapacity`.
-    """
-    if spud.diameter <= 0:
-        return 0.0
-    idx = get_layer_index_at_depth(depth, layers)
-    gamma_prime = get_average_property_value(depth, layers, prop="gamma")
-    phi = interpolate_profile(depth, layers[idx].phi_profile)
-    if apply_phi_red:
-        phi -= 5.0
-    phi = max(phi, 0.0)
-    po_prime = get_overburden_pressure(depth, layers)
-    if phi <= 0.0:
-        return po_prime * spud.area
-    phi_rad = math.radians(phi)
-    Nq = math.exp(math.pi * math.tan(phi_rad)) * (math.tan(math.pi / 4.0 + phi_rad / 2.0) ** 2)
-    Ngamma = 2.0 * (Nq + 1.0) * math.tan(phi_rad)
-    d_over_B = depth / spud.diameter if spud.diameter > 0 else 0.0
-    dq = 1.0 + 2.0 * math.tan(phi_rad) * ((1.0 - math.sin(phi_rad)) ** 2) * d_over_B
-    sq = 1.0 + math.tan(phi_rad)
-    sgamma = 0.6
-    Fv = (0.5 * gamma_prime * spud.diameter * Ngamma * sgamma + po_prime * Nq * sq * dq) * spud.area
-    return Fv
-
-
-def calculate_squeezing_capacity(spud: Spudcan, depth: float, layers: List[SoilLayer], has_backflow: bool,
-                                 apply_trigger: bool) -> Optional[float]:
-    """Calculate squeezing capacity for clay‑over‑clay layering.
-
-    Returns vertical capacity in kN or None if squeezing does not
-    apply.  Implements SNAME §6.2.6.1 and respects the geometric
-    trigger (if apply_trigger is True).
-    """
-    idx = get_layer_index_at_depth(depth, layers)
+# ---------------- Special modes (kN) ----------------
+def squeeze_capacity(spud: Spudcan, z: float, layers: List[SoilLayer],
+                     enforce_trigger: bool, backflow_zero: bool) -> Optional[float]:
+    """Strong over weak clay; requires next layer exists and is stronger."""
+    idx = _layer_index(z, layers)
     if idx + 1 >= len(layers):
         return None
-    topL = layers[idx]
-    botL = layers[idx + 1]
-    if topL.soil_type != "clay":
+    top, bot = layers[idx], layers[idx+1]
+    if top.soil_type not in ("clay", "silt"):
         return None
-    B = spud.diameter
-    T = topL.bottom_depth - depth
-    if T <= 0 or B <= 0:
+    B, A = spud.B, spud.A
+    cu_t = _avg_over(z, z + B/2.0, top.su)
+    cu_b = _avg_over(top.z_bot, top.z_bot + B/2.0, bot.su)
+    if not np.isfinite(cu_t) or not np.isfinite(cu_b):
         return None
-    cu_t = avg_over_window_b2(depth, B, layers, "su")
-    cu_b = avg_over_window_b2(topL.bottom_depth, B, layers, "su")
-    if cu_t <= 0 or cu_b <= 0:
+    if cu_b <= 1.5 * cu_t:   # needs pronounced contrast
         return None
-    if cu_b <= 1.5 * cu_t:
+    T = top.z_bot - z
+    if T <= 0:
         return None
-    if apply_trigger:
-        if B < 3.45 * T * (1.0 + 1.1 * (depth / B)):
+    if enforce_trigger:
+        if B < 3.45 * T * (1.0 + 1.1 * (z / max(B,1e-6))):
             return None
-    po_prime = 0.0 if has_backflow else get_overburden_pressure(depth, layers)
-    # SNAME recommended constants a = 5.0, b = 0.33, c = 1.2
-    a = 5.0
-    b = 0.33
-    c = 1.2
-    Fv = spud.area * ((a + b * (B / T) + c * (depth / B)) * cu_t + po_prime)
-    return Fv
+    p0 = 0.0 if backflow_zero else _overburden(z, layers)
+    # lower-bound expression consistent with SNAME commentary intent (simple conservative form)
+    # Fv = A * [(5 + 0.33*(B/T) + 1.2*(z/B)) * cu_t + p0]
+    Fv = A * ((5.0 + 0.33*(B/T) + 1.2*(z/max(B,1e-6))) * cu_t + p0)
+    return float(Fv)
 
-
-def calculate_punch_through_capacity(spud: Spudcan, depth: float, layers: List[SoilLayer], has_backflow: bool) -> Optional[float]:
-    """Calculate punch‑through capacity for layered soils.
-
-    Supports clay over clay and sand over clay sequences.  Returns
-    vertical capacity in kN or None if punch‑through does not apply.
-    Implements the simplified forms of SNAME §6.2.6.2–6.2.6.3.  If
-    Su or φ data are missing, punch‑through is not evaluated.
-    """
-    idx = get_layer_index_at_depth(depth, layers)
+def punchthrough_capacity(spud: Spudcan, z: float, layers: List[SoilLayer],
+                          backflow_zero: bool) -> Optional[float]:
+    """Two common cases: CLAY/CLAY with stronger below; SAND over CLAY."""
+    idx = _layer_index(z, layers)
     if idx + 1 >= len(layers):
         return None
-    topL = layers[idx]
-    botL = layers[idx + 1]
-    B = spud.diameter
-    H = topL.bottom_depth - depth
-    if H <= 0 or B <= 0:
+    top, bot = layers[idx], layers[idx+1]
+    H = top.z_bot - z
+    if H <= 0:
         return None
-    # Clay over clay
-    if topL.soil_type == "clay" and botL.soil_type == "clay":
-        cu_t = avg_over_window_b2(depth, B, layers, "su")
-        cu_b = avg_over_window_b2(topL.bottom_depth, B, layers, "su")
-        if cu_t <= 0 or cu_b <= 0 or cu_t <= cu_b:
+    B, A = spud.B, spud.A
+
+    # clay over clay: top weaker than bottom? (punch risk when top is stronger and fails)
+    if top.soil_type in ("clay","silt") and bot.soil_type in ("clay","silt"):
+        cu_t = _avg_over(z, z + B/2.0, top.su)
+        cu_b = _avg_over(top.z_bot, top.z_bot + B/2.0, bot.su)
+        if not np.isfinite(cu_t) or not np.isfinite(cu_b):
             return None
-        po_p = 0.0 if has_backflow else get_overburden_pressure(depth + H, layers)
-        d_over_B = (depth + H) / B
-        dc = 1.0 + 0.2 * d_over_B
-        Fv = spud.area * (3.0 * (H / B) * cu_t + 5.14 * 1.2 * dc * cu_b + po_p)
-        return Fv
-    # Sand over clay
-    if topL.soil_type == "sand" and botL.soil_type == "clay":
-        # Underlying clay capacity at depth d+H (no backflow for PT)
-        Fv_b = calculate_clay_capacity(spud, depth + H, layers, False, True)
-        gamma_s = get_average_property_value(topL.bottom_depth, layers, prop="gamma", start_depth=depth)
-        po_s = get_overburden_pressure(depth, layers)
-        cu_c = avg_over_window_b2(topL.bottom_depth, B, layers, "su")
-        KsTanPhi = 0.0
-        if B > 0 and gamma_s > 0:
-            KsTanPhi = (3.0 * cu_c) / (B * gamma_s)
-        Fv = Fv_b - spud.area * H * gamma_s + 2.0 * (H / B) * (H * gamma_s + 2.0 * po_s) * KsTanPhi * spud.area
-        return Fv
+        if cu_t <= cu_b:
+            return None
+        Nc, sc = 5.14, 1.2
+        p0b = 0.0 if backflow_zero else _overburden(z + H, layers)
+        Fv = A * (3.0*(H/max(B,1e-6))*cu_t + Nc*sc*(1.0 + 0.2*((z+H)/max(B,1e-6))) * cu_b + p0b)
+        return float(Fv)
+
+    # sand over clay
+    if top.soil_type == "sand" and bot.soil_type in ("clay","silt"):
+        # effective capacity at lower interface, minus sand self-weight effect + shear transfer
+        Fv_b = clay_capacity(spud, z + H, layers, use_min_cu=True, backflow_zero=False)
+        if Fv_b is None:
+            return None
+        gamma_s = _gamma_prime(top.z_bot, layers)
+        p0_s   = _overburden(z, layers)
+        cu_c   = _avg_over(top.z_bot, top.z_bot + B/2.0, bot.su)
+        if not np.isfinite(gamma_s) or not np.isfinite(cu_c):
+            return None
+        KsTanPhi = (3.0 * cu_c) / (max(B,1e-6) * max(gamma_s,1e-6))
+        Fv = Fv_b - A * H * gamma_s + 2.0 * (H/max(B,1e-6)) * (H*gamma_s + 2.0*p0_s) * KsTanPhi * A
+        return float(Fv)
+
     return None
 
-
-def get_average_property_value(end_depth: float, layers: List[SoilLayer], prop: str,
-                               start_depth: float = 0.0) -> float:
-    """Average a soil property (Su or γ') between start_depth and end_depth.
-
-    Mirrors the VBA `GetAveragePropertyValue`.  If end_depth <=
-    start_depth, returns the property at end_depth.
-    """
-    if end_depth <= start_depth:
-        idx = get_layer_index_at_depth(end_depth, layers)
-        layer = layers[idx]
-        if prop == "su":
-            return interpolate_profile(end_depth, layer.su_profile)
-        else:
-            return interpolate_profile(end_depth, layer.unit_weight_profile)
-    step = 0.2
-    total = 0.0
-    count = 0
-    d = start_depth
-    while d <= end_depth:
-        idx = get_layer_index_at_depth(d, layers)
-        layer = layers[idx]
-        if prop == "su":
-            val = interpolate_profile(d, layer.su_profile)
-        else:
-            val = interpolate_profile(d, layer.unit_weight_profile)
-        total += val
-        count += 1
-        d += step
-    return total / count if count > 0 else 0.0
-
-
-def calculate_penetration_curve(spud: Spudcan, layers: List[SoilLayer], depth_step: float,
-                                max_depth: float, meyerhof: List[SoilDataPoint],
-                                use_min_cu: bool, apply_phi_red: bool,
-                                windward_factor: bool, apply_trigger: bool) -> pd.DataFrame:
-    """Compute the penetration curve for a given spudcan and soil profile.
-
-    Returns a DataFrame with the following columns (all capacities in MN):
-
-      * Depth (m)
-      * Idle Clay (MN) – general shear capacity in clay (or None if not applicable)
-      * Idle Sand (MN) – general shear capacity in sand (or None if not applicable)
-      * REAL Clay (MN) – governing clay capacity including squeezing/punch‑through (or None)
-      * REAL Sand (MN) – governing sand capacity including punch‑through (or None)
-      * REAL Capacity (MN) – minimum of REAL Clay and REAL Sand where available
-      * Governing Mode – "clay" or "sand" depending on which capacity controls
-      * Backflow – True/False flag
-      * Squeeze Cap (MN) – squeezing capacity if computed
-      * PT Cap (MN) – punch‑through capacity if computed
-
-    The controlling capacity column facilitates a single penetration
-    prediction instead of comparing clay and sand bounds when only one
-    soil parameter is available.
-    """
-    depths = np.arange(0.0, max_depth + depth_step, depth_step)
-    results: Dict[str, List] = {
-        "Depth (m)": [],
-        "Idle Clay (MN)": [],
-        "Idle Sand (MN)": [],
-        "REAL Clay (MN)": [],
-        "REAL Sand (MN)": [],
-        "REAL Capacity (MN)": [],
-        "Governing Mode": [],
-        "Backflow": [],
-        "Squeeze Cap (MN)": [],
-        "PT Cap (MN)": [],
+# ---------------- Master sweep ----------------
+def compute_envelopes(
+    spud: Spudcan,
+    layers: List[SoilLayer],
+    max_depth: float,
+    dz: float = 0.25,
+    use_min_cu: bool = USE_MIN_CU_POINT_AVG_DEFAULT,
+    phi_reduction: bool = APPLY_PHI_REDUCTION_DEFAULT,
+    windward_factor: bool = APPLY_WINDWARD_FACTOR_DEFAULT,
+    squeeze_trigger: bool = APPLY_SQUEEZE_TRIGGER_DEFAULT,
+    meyerhof_table: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Returns a dataframe with per-depth results. Capacities stored in MN."""
+    n = int(np.floor(max_depth / dz)) + 1
+    depths = np.round(np.linspace(0.0, n*dz, n+1)[:n], 6)  # avoid fp drift
+    out: Dict[str, list] = {
+        "depth": [],
+        "idle_clay_MN": [],
+        "idle_sand_MN": [],
+        "real_MN": [],
+        "gov": [],
+        "backflow": [],
+        "squeeze_MN": [],
+        "punch_MN": [],
+        "real_clay_only_MN": [],
+        "real_sand_only_MN": [],
     }
-    for d in depths:
-        idx = get_layer_index_at_depth(d, layers)
-        has_backflow = backflow_check(d, spud.diameter, layers, meyerhof)
-        # Determine if Su or φ data exist at this depth
-        layer = layers[idx]
-        su_val = interpolate_profile(d, layer.su_profile)
-        phi_val = interpolate_profile(d, layer.phi_profile)
-        su_valid = bool(layer.su_profile) and su_val > 0.0
-        phi_valid = bool(layer.phi_profile) and phi_val > 0.0
-        # Compute idle capacities only if data valid
-        idle_clay_kN = calculate_clay_capacity(spud, d, layers, has_backflow, use_min_cu) if su_valid else 0.0
-        idle_sand_kN = calculate_sand_capacity(spud, d, layers, apply_phi_red) if phi_valid else 0.0
-        # Special modes apply only if Su data exists (they rely on clay strength)
-        squeeze_cap_kN = calculate_squeezing_capacity(spud, d, layers, has_backflow, apply_trigger) if su_valid else None
-        pt_cap_kN = calculate_punch_through_capacity(spud, d, layers, has_backflow) if su_valid else None
-        # Determine real clay and sand capacities
-        real_clay_kN: Optional[float] = None
-        real_sand_kN: Optional[float] = None
-        clay_mode: Optional[str] = None
-        sand_mode: Optional[str] = None
-        if su_valid:
-            real_clay_kN = idle_clay_kN
-            clay_mode = "General"
-            if squeeze_cap_kN is not None:
-                if real_clay_kN <= 0 or squeeze_cap_kN < real_clay_kN:
-                    real_clay_kN = squeeze_cap_kN
-                    clay_mode = "Squeezing"
-            if pt_cap_kN is not None and (layer.soil_type != "sand"):
-                if real_clay_kN <= 0 or pt_cap_kN < real_clay_kN:
-                    real_clay_kN = pt_cap_kN
-                    clay_mode = "Punch‑Through"
-        # Sand capacities
-        if phi_valid:
-            real_sand_kN = idle_sand_kN
-            sand_mode = "General"
-            if pt_cap_kN is not None and (layer.soil_type == "sand"):
-                if real_sand_kN <= 0 or pt_cap_kN < real_sand_kN:
-                    real_sand_kN = pt_cap_kN
-                    sand_mode = "Punch‑Through"
-        # Apply windward factor to real capacities
+
+    for z in depths:
+        # backflow check using Meyerhof
+        N = _meyerhof_N(z / max(spud.B,1e-6), meyerhof_table)
+        cu_avg = np.nan
+        gamma_avg = np.nan
+        if _has_su_here(z, layers):
+            i = _layer_index(z, layers)
+            cu_avg = _avg_over(z, z + spud.B/2.0, layers[i].su)
+            gamma_avg = _avg_over(z, z + spud.B/2.0, layers[i].gamma)
+        backflow = False
+        if np.isfinite(cu_avg) and np.isfinite(gamma_avg) and gamma_avg > 0:
+            backflow = z > (N * cu_avg) / gamma_avg
+
+        # idle envelopes (compute only where property exists)
+        Fc = clay_capacity(spud, z, layers, use_min_cu=use_min_cu, backflow_zero=backflow)
+        Fs = sand_capacity(spud, z, layers, apply_phi_reduction=phi_reduction)
+
+        # specials (only meaningful where they return a finite number)
+        Fsq = squeeze_capacity(spud, z, layers, enforce_trigger=squeeze_trigger, backflow_zero=backflow)
+        Fpt = punchthrough_capacity(spud, z, layers, backflow_zero=backflow)
+
+        # Compose candidates for REAL at this depth:
+        # 1) If clay is viable, it may be reduced by the least applicable special.
+        # 2) If sand is viable, it may be reduced by punch-through when applicable.
+        real_clay = None
+        if Fc is not None:
+            real_clay = Fc
+            if Fsq is not None:
+                real_clay = min(real_clay, Fsq)
+            if Fpt is not None and layers[_layer_index(z, layers)].soil_type != "sand":
+                real_clay = min(real_clay, Fpt)
+
+        real_sand = None
+        if Fs is not None:
+            real_sand = Fs
+            if Fpt is not None and layers[_layer_index(z, layers)].soil_type == "sand":
+                real_sand = min(real_sand, Fpt)
+
+        # Apply windward factor to REAL candidates only (if enabled)
         if windward_factor:
-            if real_clay_kN is not None:
-                real_clay_kN *= 0.8
-            if real_sand_kN is not None:
-                real_sand_kN *= 0.8
-        # Convert to MN (set None if capacity <= 0)
-        idle_clay_MN = idle_clay_kN / 1000.0 if idle_clay_kN > 0 else None
-        idle_sand_MN = idle_sand_kN / 1000.0 if idle_sand_kN > 0 else None
-        real_clay_MN = real_clay_kN / 1000.0 if real_clay_kN and real_clay_kN > 0 else None
-        real_sand_MN = real_sand_kN / 1000.0 if real_sand_kN and real_sand_kN > 0 else None
-        # Determine controlling capacity and governing mode
-        ctrl_MN = None
-        ctrl_mode = None
-        # Consider only positive capacities for control
-        candidates: List[Tuple[float, str]] = []
-        if real_clay_MN is not None:
-            candidates.append((real_clay_MN, "clay"))
-        if real_sand_MN is not None:
-            candidates.append((real_sand_MN, "sand"))
-        if candidates:
-            ctrl_MN, ctrl_mode = min(candidates, key=lambda x: x[0])
-        results["Depth (m)"].append(d)
-        results["Idle Clay (MN)"].append(idle_clay_MN)
-        results["Idle Sand (MN)"].append(idle_sand_MN)
-        results["REAL Clay (MN)"].append(real_clay_MN)
-        results["REAL Sand (MN)"].append(real_sand_MN)
-        results["REAL Capacity (MN)"].append(ctrl_MN)
-        results["Governing Mode"].append(ctrl_mode)
-        results["Backflow"].append(has_backflow)
-        results["Squeeze Cap (MN)"].append(squeeze_cap_kN / 1000.0 if squeeze_cap_kN else None)
-        results["PT Cap (MN)"].append(pt_cap_kN / 1000.0 if pt_cap_kN else None)
-    return pd.DataFrame(results)
+            if real_clay is not None:
+                real_clay *= 0.8
+            if real_sand is not None:
+                real_sand *= 0.8
 
+        # Select governing REAL
+        gov = ""
+        real = None
+        if (real_clay is not None) and (real_sand is not None):
+            if real_clay <= real_sand:
+                real = real_clay; gov = "Clay-governed"
+            else:
+                real = real_sand; gov = "Sand-governed"
+        elif real_clay is not None:
+            real = real_clay; gov = "Clay-only"
+        elif real_sand is not None:
+            real = real_sand; gov = "Sand-only"
 
-def interpolate_penetration(df: pd.DataFrame, preload_MN: float, col: str) -> float:
-    """Find the penetration (depth) at which a capacity column equals the preload.
+        # write MN
+        out["depth"].append(z)
+        out["idle_clay_MN"].append(np.nan if Fc is None else Fc/1000.0)
+        out["idle_sand_MN"].append(np.nan if Fs is None else Fs/1000.0)
+        out["real_MN"].append(np.nan if real is None else real/1000.0)
+        out["gov"].append(gov if gov else "NA")
+        out["backflow"].append("Yes" if backflow else "No")
+        out["squeeze_MN"].append(np.nan if Fsq is None else Fsq/1000.0)
+        out["punch_MN"].append(np.nan if Fpt is None else Fpt/1000.0)
+        out["real_clay_only_MN"].append(np.nan if real_clay is None else real_clay/1000.0)
+        out["real_sand_only_MN"].append(np.nan if real_sand is None else real_sand/1000.0)
 
-    Performs linear interpolation on the specified DataFrame column
-    (which may contain None/NaN values).  If all values are NaN,
-    returns the deepest depth.  If preload exceeds the maximum
-    capacity in the column, returns the deepest depth.  Mirrors the
-    VBA `InterpolatePenetration`.
-    """
-    depths = df["Depth (m)"].values
-    capacities = df[col].values
-    # Convert None to NaN for interpolation
-    capacities = np.array([c if c is not None else np.nan for c in capacities], dtype=float)
-    if np.all(np.isnan(capacities)):
-        return depths[-1]
-    for i in range(1, len(capacities)):
-        x1, x2 = capacities[i - 1], capacities[i]
-        if np.isnan(x1) or np.isnan(x2):
-            continue
-        if (x1 <= preload_MN <= x2) or (x2 <= preload_MN <= x1):
-            d1, d2 = depths[i - 1], depths[i]
-            if x2 == x1:
-                return d2
-            return d1 + (preload_MN - x1) * (d2 - d1) / (x2 - x1)
-    return depths[-1]
+    return pd.DataFrame(out)
 
+# ---------------- Penetration utility ----------------
+def _penetration_for_load_MN(df: pd.DataFrame, col: str, load_MN: float) -> Optional[float]:
+    """Linear interpolate depth at which capacity == load; returns None if no crossing."""
+    x = df[col].to_numpy(dtype=float)
+    z = df["depth"].to_numpy(dtype=float)
+    mask = np.isfinite(x)
+    x = x[mask]; z = z[mask]
+    if x.size < 2:
+        return None
+    # need first z where x>=load; assume monotonic nondecreasing is typical
+    if load_MN > x.max():
+        return None
+    j = np.where(x >= load_MN)[0]
+    if j.size == 0:
+        return None
+    j = j[0]
+    if j == 0:
+        return float(z[0])
+    x1, x2 = x[j-1], x[j]
+    z1, z2 = z[j-1], z[j]
+    if x2 == x1:
+        return float(z2)
+    return float(z1 + (load_MN - x1) * (z2 - z1) / (x2 - x1))
 
-def parse_excel_details_spc(df: pd.DataFrame) -> Tuple[List[Spudcan], List[SoilDataPoint]]:
-    """Parse spudcan details and Meyerhof N chart from a raw DataFrame.
+def penetration_results(spud: Spudcan, df: pd.DataFrame) -> Dict[str, Optional[float]]:
+    """Returns analysis-depth and tip-penetration results (m). Range is reported when both envelopes exist."""
+    P = spud.preload_MN
+    # independently compute penetrations from clay-only and sand-only REALs
+    z_clay = _penetration_for_load_MN(df, "real_clay_only_MN", P)
+    z_sand = _penetration_for_load_MN(df, "real_sand_only_MN", P)
 
-    The DataFrame `df` corresponds to the `Details‑SPC` sheet with
-    no header.  Columns 0–4 contain rig name, diameter (m), area
-    (m²), tip elevation (m) and max preload (MN).  Columns 10 and 11
-    may contain depth ratio (d/B) and N values for the Meyerhof
-    backflow chart.  Returns a list of `Spudcan` objects (max
-    preload converted to kN) and a sorted Meyerhof profile.
-    """
-    spuds: List[Spudcan] = []
-    meyerhof_profile: List[SoilDataPoint] = []
-    for _, row in df.iterrows():
-        rig = str(row.get(0, "")).strip()
-        if not rig:
-            continue
-        try:
-            diameter = float(row.get(1, 0))
-        except Exception:
-            diameter = 0.0
-        try:
-            area = float(row.get(2, 0))
-        except Exception:
-            area = 0.0
-        try:
-            tip_elev = float(row.get(3, 0))
-        except Exception:
-            tip_elev = 0.0
-        try:
-            preload_MN = float(row.get(4, 0))
-        except Exception:
-            preload_MN = 0.0
-        spuds.append(Spudcan(rig_name=rig, diameter=diameter, area=area,
-                             tip_elevation=tip_elev, max_preload=preload_MN * 1000.0))
-    # Parse Meyerhof chart if present
-    try:
-        dr_col = df.columns[10]
-        n_col = df.columns[11]
-        for _, row in df.iterrows():
-            depth_ratio = row.get(dr_col, None)
-            n_value = row.get(n_col, None)
-            if depth_ratio is not None and n_value is not None and pd.notna(depth_ratio) and pd.notna(n_value):
-                try:
-                    dr = float(depth_ratio)
-                    nv = float(n_value)
-                    meyerhof_profile.append(SoilDataPoint(depth=dr, value=nv))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    meyerhof_profile.sort(key=lambda p: p.depth)
-    return spuds, meyerhof_profile
-
-
-def parse_soil_information(df: pd.DataFrame) -> Tuple[List[SoilLayer], float]:
-    """Parse the `Soil Information` sheet into layers.
-
-    Expects a raw DataFrame with no header.  Each soil layer begins
-    with a row where column 0 (A) is non‑empty.  Columns 1 and 2
-    contain top and bottom depths, column 4 (E) contains a text
-    description used to classify the soil type.  Depth/value pairs for
-    gamma' are in columns F (5) and G (6), φ in H (7) and I (8), and
-    Su in J (9) and K (10).  The total analysis depth may appear
-    in L3 (0‑based row index 2, column 11).  Returns the list of
-    layers and the max depth.
-    """
-    layers: List[SoilLayer] = []
-    max_depth = 0.0
-    try:
-        max_depth = float(df.iloc[2, 11])
-    except Exception:
-        max_depth = 0.0
-    # Identify header rows
-    header_indices = []
-    for i in range(len(df)):
-        val = df.iloc[i, 0]
-        if pd.notna(val) and str(val).strip() != "":
-            header_indices.append(i)
-    for idx, row_idx in enumerate(header_indices):
-        name = str(df.iloc[row_idx, 0])
-        try:
-            top_depth = float(df.iloc[row_idx, 1])
-        except Exception:
-            top_depth = 0.0
-        try:
-            bottom_depth = float(df.iloc[row_idx, 2])
-        except Exception:
-            bottom_depth = top_depth
-        soil_desc = str(df.iloc[row_idx, 4]).lower() if pd.notna(df.iloc[row_idx, 4]) else ""
-        if "clay" in soil_desc:
-            soil_type = "clay"
-        elif "silt" in soil_desc:
-            soil_type = "silt"
-        elif "sand" in soil_desc:
-            soil_type = "sand"
-        else:
-            soil_type = "unknown"
-        # End row for this layer
-        end_row = header_indices[idx + 1] if idx + 1 < len(header_indices) else len(df)
-        unit_profile: List[SoilDataPoint] = []
-        phi_profile: List[SoilDataPoint] = []
-        su_profile: List[SoilDataPoint] = []
-        for j in range(row_idx + 1, end_row):
-            try:
-                d_gamma = df.iloc[j, 5]
-                v_gamma = df.iloc[j, 6]
-                if pd.notna(d_gamma) and pd.notna(v_gamma):
-                    d_gamma = float(d_gamma)
-                    v_gamma = float(v_gamma)
-                    if top_depth <= d_gamma < bottom_depth:
-                        unit_profile.append(SoilDataPoint(depth=d_gamma, value=v_gamma))
-            except Exception:
-                pass
-            try:
-                d_phi = df.iloc[j, 7]
-                v_phi = df.iloc[j, 8]
-                if pd.notna(d_phi) and pd.notna(v_phi):
-                    d_phi = float(d_phi)
-                    v_phi = float(v_phi)
-                    if top_depth <= d_phi < bottom_depth:
-                        phi_profile.append(SoilDataPoint(depth=d_phi, value=v_phi))
-            except Exception:
-                pass
-            try:
-                d_su = df.iloc[j, 9]
-                v_su = df.iloc[j, 10]
-                if pd.notna(d_su) and pd.notna(v_su):
-                    d_su = float(d_su)
-                    v_su = float(v_su)
-                    if top_depth <= d_su < bottom_depth and v_su > 0:
-                        su_profile.append(SoilDataPoint(depth=d_su, value=v_su))
-            except Exception:
-                pass
-        # Sort profiles by depth
-        unit_profile.sort(key=lambda p: p.depth)
-        phi_profile.sort(key=lambda p: p.depth)
-        su_profile.sort(key=lambda p: p.depth)
-        layers.append(SoilLayer(name=name, top_depth=top_depth, bottom_depth=bottom_depth,
-                                soil_type=soil_type, unit_weight_profile=unit_profile,
-                                su_profile=su_profile, phi_profile=phi_profile))
-    return layers, max_depth
-
-
-def SDPArrayHasData(arr: List[SoilDataPoint]) -> bool:
-    """Return True if the SoilDataPoint list has data."""
-    return bool(arr)
-
-
-def SDPArrayHasData_2D(arr: List[List[SoilDataPoint]]) -> bool:
-    return any(arr)
+    res: Dict[str, Optional[float]] = {
+        "z_clay": None if z_clay is None else float(z_clay),
+        "z_sand": None if z_sand is None else float(z_sand),
+        "tip_clay": None if z_clay is None else float(z_clay + spud.tip_elev),
+        "tip_sand": None if z_sand is None else float(z_sand + spud.tip_elev),
+        "z_range_min": None,
+        "z_range_max": None,
+        "tip_range_min": None,
+        "tip_range_max": None,
+    }
+    candidates = [v for v in [z_clay, z_sand] if v is not None]
+    if candidates:
+        res["z_range_min"] = min(candidates)
+        res["z_range_max"] = max(candidates)
+        res["tip_range_min"] = res["z_range_min"] + spud.tip_elev
+        res["tip_range_max"] = res["z_range_max"] + spud.tip_elev
+    return res
